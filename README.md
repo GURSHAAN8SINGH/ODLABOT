@@ -8,6 +8,36 @@ ODLABOT is a CLI log analyzer bot that:
 - generates a simple stakeholder-ready email summary,
 - optionally uses OpenRouter LLM for enhanced analysis and email draft.
 
+## Compatibility
+
+ODLABOT is currently tested for `Python 3.7.x`. If you are using another Python version, create a `3.7.x` virtual environment before installing dependencies.
+
+## Setup
+
+1. Install `Python 3.7.x`.
+2. Clone the repository.
+3. Create and activate a virtual environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+4. Install dependencies:
+
+```powershell
+pip install -r .\requirements.txt
+```
+
+5. If you want OpenRouter-enhanced analysis, add your API key to `.env`:
+
+```env
+OPENROUTER_API_KEY=your_api_key_here
+OPENROUTER_MODEL=openai/gpt-4o-mini
+```
+
+6. Run the CLI or Streamlit UI.
+
 ## Run
 
 ```powershell
@@ -30,28 +60,24 @@ streamlit run .\app.py
 
 Then upload a file (`.log`, `.txt`, `.csv`, `.xlsx`, `.xls`) in the browser and use the form fields for ticket/history/verification context.
 
-## OpenRouter LLM mode
+## OpenRouter API Key
 
-Install dependencies:
+To use the OpenRouter-enhanced mode, you need an OpenRouter API key.
+OpenRouter's API key docs are here: [Authentication](https://openrouter.ai/docs/api-keys) and [Create a new API key](https://openrouter.ai/docs/api/api-reference/api-keys/create-keys).
 
-```powershell
-pip install -r .\requirements.txt
-```
+1. Sign in to your OpenRouter account.
+2. Open the API keys page in the OpenRouter dashboard.
+3. Create a new key, give it a name, and optionally set a spending limit.
+4. Copy the key once and store it safely.
+5. Add it to your `.env` file.
 
-Python compatibility in this repo is currently pinned for `Python 3.7.x`.
-
-Set API key in `.env`:
-
-```env
-OPENROUTER_API_KEY=your_api_key_here
-OPENROUTER_MODEL=openai/gpt-4o-mini
-```
-
-Or set via shell:
+You can also set it for the current PowerShell session:
 
 ```powershell
 $env:OPENROUTER_API_KEY="your_api_key_here"
 ```
+
+## OpenRouter LLM mode
 
 Run with LLM enabled:
 
