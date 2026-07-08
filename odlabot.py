@@ -45,6 +45,95 @@ TIMESTAMP_PATTERNS = [
 ]
 
 
+BUCKET_FIELDS = ["time", "started"]
+
+BUILD_VERSION_FIELDS = [
+    "beets", "tacos", "new_beets", "dallas",
+    "helm_chart", "from_helm_chart", "pcc_framework",
+]
+
+BUILD_FAILURE_KEYWORDS = re.compile(
+    r"\b(install|installation|deploy|deployment|helm|chart|dallas|beets|tacos|"
+    r"upgrade|rollout|image|pull|push|registry|artifact|package|rpm|deb|binary|"
+    r"version mismatch|build failed|build error|not found|no such image)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclasses.dataclass
+class FailureTrendResult:
+    # ordered list of (hour_bucket_str, failure_count)
+    hourly_buckets: list[tuple[str, int]]
+    # hour bucket where failures first appeared
+    first_failure_hour: str
+    # hour bucket with the peak failure count
+    peak_failure_hour: str
+    peak_failure_count: int
+    # True if the last half of buckets has a higher avg than the first half
+    is_accelerating: bool
+    # build version seen at first failure hour {component: version}
+    build_at_first_failure: dict[str, str]
+
+
+@dataclasses.dataclass
+class DurationAnomalyResult:
+    median_duration: float
+    p95_duration: float
+    outliers: list[tuple[str, float]]  # (tc_name, duration_minutes)
+    has_anomalies: bool
+
+
+@dataclasses.dataclass
+class BuildIntroductionResult:
+    # {component: {version: first_failure_hour}}
+    first_failure_per_version: dict[str, dict[str, str]]
+    # component + version most likely to have introduced failures
+    suspected_build: str
+
+
+@dataclasses.dataclass
+class FlakyTestResult:
+    # {tc_name: {"passed": n, "failed": n}}
+    flaky_tests: dict[str, dict[str, int]]
+    consistently_failing: list[str]
+
+
+@dataclasses.dataclass
+class JiraGroupResult:
+    # {jira_id: list of tc_names}
+    jira_groups: dict[str, list[str]]
+    untracked_count: int
+
+
+@dataclasses.dataclass
+class NodeIsolationResult:
+    # {node: failure_count}
+    node_failure_counts: dict[str, int]
+    # {cluster_id: failure_count}
+    cluster_failure_counts: dict[str, int]
+    is_isolated_to_single_node: bool
+    is_isolated_to_single_cluster: bool
+    dominant_node: str
+    dominant_cluster: str
+
+
+@dataclasses.dataclass
+class FailingStepGroupResult:
+    # [(first_failing_step, first_error, count)]
+    step_groups: list[tuple[str, str, int]]
+
+
+@dataclasses.dataclass
+class BuildConsistencyResult:
+    # {component: Counter{version: count}}
+    version_distributions: dict[str, collections.Counter]
+    # components where more than one distinct non-empty version was seen
+    mismatched: list[str]
+    # components where all rows share exactly one version
+    consistent: list[str]
+    is_build_suspect: bool
+
+
 @dataclasses.dataclass
 class AnalysisResult:
     total_lines: int
@@ -69,6 +158,14 @@ class AnalysisResult:
     first_failing_step: str
     first_failure_line: str
     repeated_failure_ratio: float
+    build_consistency: BuildConsistencyResult | None
+    failure_trend: FailureTrendResult | None
+    duration_anomalies: DurationAnomalyResult | None
+    build_introduction: BuildIntroductionResult | None
+    flaky_tests: FlakyTestResult | None
+    jira_groups: JiraGroupResult | None
+    node_isolation: NodeIsolationResult | None
+    failing_step_groups: FailingStepGroupResult | None
 
 
 @dataclasses.dataclass
@@ -263,7 +360,410 @@ def infer_data_mode(verdict_counts: dict[str, int], origins_verdict_counts: dict
     return "no-verdict-data"
 
 
+def _parse_hour_bucket(line: str) -> str | None:
+    """Extract an hour-level bucket string (YYYY-MM-DD HH) from a JSON log line or raw text."""
+    for field in BUCKET_FIELDS:
+        value = extract_field(line, [field])
+        if value:
+            m = re.match(r"(\d{4}-\d{2}-\d{2})[T ](\d{2})", value)
+            if m:
+                return f"{m.group(1)} {m.group(2)}:00"
+    # fallback: scan raw text for a timestamp
+    m = re.search(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}):\d{2}", line)
+    if m:
+        return f"{m.group(1)} {m.group(2)}:00"
+    return None
+
+
+def analyze_failure_trend(
+    lines: list[str],
+    build_version_counters: dict[str, collections.Counter],
+) -> FailureTrendResult | None:
+    # bucket_failures: {hour_bucket: failure_count}
+    bucket_failures: collections.Counter[str] = collections.Counter()
+    # bucket_builds: {hour_bucket: {component: Counter{version}}}
+    bucket_builds: dict[str, dict[str, collections.Counter]] = {}
+
+    for line in lines:
+        lower = line.lower()
+        is_error_like = any(
+            pat.search(lower)
+            for sev, pat in SEVERITY_PATTERNS.items()
+            if sev in {"fatal", "error", "timeout"}
+        )
+        bucket = _parse_hour_bucket(line)
+        if bucket is None:
+            continue
+        if is_error_like:
+            bucket_failures[bucket] += 1
+        if bucket not in bucket_builds:
+            bucket_builds[bucket] = {f: collections.Counter() for f in BUILD_VERSION_FIELDS}
+        for field in BUILD_VERSION_FIELDS:
+            val = extract_field(line, [field])
+            if val and val not in ("", "N/A", "n/a", "na", "none", "null"):
+                bucket_builds[bucket][field][val] += 1
+
+    if not bucket_failures:
+        return None
+
+    sorted_buckets = sorted(bucket_failures.items())
+    first_failure_hour = sorted_buckets[0][0]
+    peak_hour, peak_count = max(sorted_buckets, key=lambda x: x[1])
+
+    counts = [c for _, c in sorted_buckets]
+    mid = max(len(counts) // 2, 1)
+    first_half_avg = sum(counts[:mid]) / mid
+    second_half_avg = sum(counts[mid:]) / max(len(counts[mid:]), 1)
+    is_accelerating = second_half_avg > first_half_avg
+
+    build_at_first = {}
+    if first_failure_hour in bucket_builds:
+        for component, counter in bucket_builds[first_failure_hour].items():
+            if counter:
+                top_version = counter.most_common(1)[0][0]
+                build_at_first[component] = top_version
+
+    return FailureTrendResult(
+        hourly_buckets=sorted_buckets,
+        first_failure_hour=first_failure_hour,
+        peak_failure_hour=peak_hour,
+        peak_failure_count=peak_count,
+        is_accelerating=is_accelerating,
+        build_at_first_failure=build_at_first,
+    )
+
+
+def format_failure_trend_summary(ft: FailureTrendResult) -> str:
+    lines = ["Failure trend over time:"]
+    lines.append(f"- First failure hour : {ft.first_failure_hour}")
+    lines.append(f"- Peak failure hour  : {ft.peak_failure_hour} ({ft.peak_failure_count} failures)")
+    lines.append(
+        f"- Trend direction    : {'ACCELERATING ↑ (failures increasing over time)' if ft.is_accelerating else 'STABLE / DECLINING ↓'}"
+    )
+    if ft.build_at_first_failure:
+        lines.append("- Build at first failure hour:")
+        for component, version in ft.build_at_first_failure.items():
+            lines.append(f"    {component}: {version}")
+    lines.append("- Hourly breakdown:")
+    max_count = max(c for _, c in ft.hourly_buckets)
+    bar_width = 30
+    for bucket, count in ft.hourly_buckets:
+        bar_len = max(1, round(count / max_count * bar_width))
+        bar = "█" * bar_len
+        lines.append(f"    {bucket}  {bar} {count}")
+    return "\n".join(lines)
+
+
+def is_build_related_error(result: AnalysisResult) -> bool:
+    """Returns True if first_failing_step or top errors contain build-related keywords."""
+    texts = [result.first_failing_step, result.first_failure_line]
+    texts += [msg for msg, _ in result.top_error_lines[:3]]
+    return any(BUILD_FAILURE_KEYWORDS.search(t) for t in texts if t)
+
+
+def analyze_duration_anomalies(lines: list[str]) -> DurationAnomalyResult | None:
+    durations: list[tuple[str, float]] = []
+    for line in lines:
+        raw = extract_field(line, ["duration"])
+        tc = extract_field(line, ["tc_name", "test_case", "testcase"]) or "unknown"
+        if raw:
+            try:
+                val = float(raw)
+                if val > 0:
+                    durations.append((tc, val))
+            except ValueError:
+                pass
+    if len(durations) < 3:
+        return None
+    vals = sorted(v for _, v in durations)
+    median = vals[len(vals) // 2]
+    p95 = vals[int(len(vals) * 0.95)]
+    threshold = max(median * 3.0, p95)
+    outliers = [(tc, v) for tc, v in durations if v >= threshold]
+    outliers.sort(key=lambda x: x[1], reverse=True)
+    return DurationAnomalyResult(
+        median_duration=round(median, 2),
+        p95_duration=round(p95, 2),
+        outliers=outliers[:10],
+        has_anomalies=len(outliers) > 0,
+    )
+
+
+def format_duration_anomaly_summary(da: DurationAnomalyResult) -> str:
+    lines = ["Duration anomaly check:"]
+    lines.append(f"- Median duration : {da.median_duration} min")
+    lines.append(f"- P95 duration    : {da.p95_duration} min")
+    if da.has_anomalies:
+        lines.append(f"- Outliers (>= {max(da.median_duration * 3, da.p95_duration):.1f} min):")
+        for tc, val in da.outliers:
+            lines.append(f"  - {tc}: {val} min")
+    else:
+        lines.append("- No duration outliers detected.")
+    return "\n".join(lines)
+
+
+def analyze_build_introduction(
+    lines: list[str],
+    build_version_counters: dict[str, collections.Counter],
+) -> BuildIntroductionResult | None:
+    # {component: {version: earliest_failure_hour}}
+    first_failure_per_version: dict[str, dict[str, str]] = {}
+    for line in lines:
+        lower = line.lower()
+        is_error_like = any(
+            pat.search(lower)
+            for sev, pat in SEVERITY_PATTERNS.items()
+            if sev in {"fatal", "error", "timeout"}
+        )
+        if not is_error_like:
+            continue
+        bucket = _parse_hour_bucket(line)
+        if not bucket:
+            continue
+        for field in BUILD_VERSION_FIELDS:
+            val = extract_field(line, [field])
+            if not val or val in ("", "N/A", "n/a", "na", "none", "null"):
+                continue
+            if field not in first_failure_per_version:
+                first_failure_per_version[field] = {}
+            existing = first_failure_per_version[field].get(val)
+            if existing is None or bucket < existing:
+                first_failure_per_version[field][val] = bucket
+    if not first_failure_per_version:
+        return None
+    # find the component+version whose first failure hour is earliest
+    earliest_hour = None
+    suspected_build = "unknown"
+    for component, version_map in first_failure_per_version.items():
+        for version, hour in version_map.items():
+            if earliest_hour is None or hour < earliest_hour:
+                earliest_hour = hour
+                suspected_build = f"{component}={version} (first failure: {hour})"
+    return BuildIntroductionResult(
+        first_failure_per_version=first_failure_per_version,
+        suspected_build=suspected_build,
+    )
+
+
+def format_build_introduction_summary(bi: BuildIntroductionResult) -> str:
+    lines = ["Build introduction check:"]
+    lines.append(f"- Most likely introducing build: {bi.suspected_build}")
+    for component, version_map in bi.first_failure_per_version.items():
+        for version, hour in sorted(version_map.items(), key=lambda x: x[1]):
+            lines.append(f"  - {component}={version}  first failure at {hour}")
+    return "\n".join(lines)
+
+
+def analyze_flaky_tests(lines: list[str]) -> FlakyTestResult | None:
+    tc_verdicts: dict[str, collections.Counter] = {}
+    for line in lines:
+        tc = extract_field(line, ["tc_name", "test_case", "testcase"])
+        verdict = extract_field(line, ["verdict"])
+        if not tc or not verdict:
+            continue
+        norm = normalize_verdict(verdict)
+        if tc not in tc_verdicts:
+            tc_verdicts[tc] = collections.Counter()
+        if norm in PASS_LIKE_VALUES:
+            tc_verdicts[tc]["passed"] += 1
+        elif norm in FAIL_LIKE_VALUES:
+            tc_verdicts[tc]["failed"] += 1
+    if not tc_verdicts:
+        return None
+    flaky: dict[str, dict[str, int]] = {}
+    consistently_failing: list[str] = []
+    for tc, counter in tc_verdicts.items():
+        has_pass = counter.get("passed", 0) > 0
+        has_fail = counter.get("failed", 0) > 0
+        if has_pass and has_fail:
+            flaky[tc] = dict(counter)
+        elif has_fail and not has_pass:
+            consistently_failing.append(tc)
+    return FlakyTestResult(flaky_tests=flaky, consistently_failing=consistently_failing)
+
+
+def format_flaky_test_summary(ft: FlakyTestResult) -> str:
+    lines = ["Flaky test detection:"]
+    if ft.flaky_tests:
+        lines.append(f"- {len(ft.flaky_tests)} flaky test(s) detected (mixed pass/fail across runs):")
+        for tc, counts in sorted(ft.flaky_tests.items(), key=lambda x: x[1].get("failed", 0), reverse=True):
+            lines.append(f"  - {tc}  passed={counts.get('passed',0)}, failed={counts.get('failed',0)}")
+    else:
+        lines.append("- No flaky tests detected.")
+    if ft.consistently_failing:
+        lines.append(f"- {len(ft.consistently_failing)} consistently failing test(s):")
+        for tc in ft.consistently_failing[:10]:
+            lines.append(f"  - {tc}")
+    return "\n".join(lines)
+
+
+def analyze_jira_groups(lines: list[str]) -> JiraGroupResult | None:
+    jira_groups: dict[str, list[str]] = {}
+    untracked = 0
+    for line in lines:
+        tc = extract_field(line, ["tc_name", "test_case", "testcase"])
+        if not tc:
+            continue
+        verdict = extract_field(line, ["verdict"])
+        if verdict and normalize_verdict(verdict) not in FAIL_LIKE_VALUES:
+            continue
+        jira = extract_field(line, ["jira_id"])
+        if jira and jira.strip():
+            if jira not in jira_groups:
+                jira_groups[jira] = []
+            if tc not in jira_groups[jira]:
+                jira_groups[jira].append(tc)
+        else:
+            untracked += 1
+    if not jira_groups and untracked == 0:
+        return None
+    return JiraGroupResult(jira_groups=jira_groups, untracked_count=untracked)
+
+
+def format_jira_group_summary(jg: JiraGroupResult) -> str:
+    lines = ["JIRA ID grouping:"]
+    if jg.jira_groups:
+        for jira_id, tcs in sorted(jg.jira_groups.items()):
+            lines.append(f"  - {jira_id} ({len(tcs)} test case(s)):")
+            for tc in tcs[:5]:
+                lines.append(f"      {tc}")
+    else:
+        lines.append("- No JIRA IDs found in failing rows.")
+    lines.append(f"- Untracked failures (no jira_id): {jg.untracked_count}")
+    return "\n".join(lines)
+
+
+def analyze_node_isolation(lines: list[str]) -> NodeIsolationResult | None:
+    node_counter: collections.Counter[str] = collections.Counter()
+    cluster_counter: collections.Counter[str] = collections.Counter()
+    for line in lines:
+        verdict = extract_field(line, ["verdict"])
+        if verdict and normalize_verdict(verdict) not in FAIL_LIKE_VALUES:
+            continue
+        node = extract_field(line, ["node", "host", "hostname"])
+        cluster = extract_field(line, ["cluster_id"])
+        if node:
+            node_counter[node] += 1
+        if cluster:
+            cluster_counter[cluster] += 1
+    if not node_counter and not cluster_counter:
+        return None
+    dominant_node = node_counter.most_common(1)[0][0] if node_counter else "unknown"
+    dominant_cluster = cluster_counter.most_common(1)[0][0] if cluster_counter else "unknown"
+    total_node_failures = sum(node_counter.values()) or 1
+    total_cluster_failures = sum(cluster_counter.values()) or 1
+    top_node_share = node_counter.most_common(1)[0][1] / total_node_failures if node_counter else 0
+    top_cluster_share = cluster_counter.most_common(1)[0][1] / total_cluster_failures if cluster_counter else 0
+    return NodeIsolationResult(
+        node_failure_counts=dict(node_counter.most_common(8)),
+        cluster_failure_counts=dict(cluster_counter.most_common(8)),
+        is_isolated_to_single_node=top_node_share >= 0.9 and len(node_counter) == 1,
+        is_isolated_to_single_cluster=top_cluster_share >= 0.9 and len(cluster_counter) == 1,
+        dominant_node=dominant_node,
+        dominant_cluster=dominant_cluster,
+    )
+
+
+def format_node_isolation_summary(ni: NodeIsolationResult) -> str:
+    lines = ["Node / cluster isolation check:"]
+    if ni.is_isolated_to_single_node:
+        lines.append(f"- ISOLATED: All failures on single node '{ni.dominant_node}' — likely an infra issue on that node.")
+    elif ni.node_failure_counts:
+        lines.append(f"- Failures spread across {len(ni.node_failure_counts)} node(s):")
+        for node, count in ni.node_failure_counts.items():
+            lines.append(f"  - {node}: {count} failure(s)")
+    if ni.is_isolated_to_single_cluster:
+        lines.append(f"- ISOLATED: All failures on single cluster '{ni.dominant_cluster}'.")
+    elif ni.cluster_failure_counts:
+        lines.append(f"- Failures spread across {len(ni.cluster_failure_counts)} cluster(s):")
+        for cluster, count in ni.cluster_failure_counts.items():
+            lines.append(f"  - {cluster}: {count} failure(s)")
+    return "\n".join(lines)
+
+
+def analyze_failing_step_groups(lines: list[str]) -> FailingStepGroupResult | None:
+    # group by (first_failing_step, first_error) and count
+    group_counter: collections.Counter[tuple[str, str]] = collections.Counter()
+    for line in lines:
+        verdict = extract_field(line, ["verdict"])
+        if verdict and normalize_verdict(verdict) not in FAIL_LIKE_VALUES:
+            continue
+        step = extract_field(line, ["first_failing_step"]) or ""
+        error = extract_field(line, ["first_error"]) or ""
+        if step or error:
+            group_counter[(step[:120], error[:120])] += 1
+    if not group_counter:
+        return None
+    return FailingStepGroupResult(
+        step_groups=[
+            (step, error, count)
+            for (step, error), count in group_counter.most_common(10)
+        ]
+    )
+
+
+def format_failing_step_groups_summary(fg: FailingStepGroupResult) -> str:
+    lines = ["Failing step pattern groups:"]
+    for idx, (step, error, count) in enumerate(fg.step_groups, start=1):
+        lines.append(f"  {idx}. [{count}x] step: {step or '(none)'}")
+        if error:
+            lines.append(f"         error: {error}")
+    return "\n".join(lines)
+
+
+def analyze_build_consistency(
+    version_distributions: dict[str, collections.Counter],
+) -> BuildConsistencyResult:
+    mismatched = []
+    consistent = []
+    for component, counter in version_distributions.items():
+        versions = [v for v in counter if v not in ("", "N/A", "n/a", "na", "none", "null")]
+        if len(versions) > 1:
+            mismatched.append(component)
+        elif len(versions) == 1:
+            consistent.append(component)
+    # If all components are on the same version, a single bad build may be the root cause.
+    # Mixed versions means failures span multiple builds, making it less likely to be build-related.
+    return BuildConsistencyResult(
+        version_distributions=version_distributions,
+        mismatched=mismatched,
+        consistent=consistent,
+        is_build_suspect=len(mismatched) == 0 and len(consistent) > 0,
+    )
+
+
+def format_build_consistency_summary(bc: BuildConsistencyResult) -> str:
+    lines = ["Build consistency check:"]
+    if not bc.version_distributions:
+        lines.append("- No build version fields detected in this file.")
+        return "\n".join(lines)
+    if bc.is_build_suspect:
+        lines.append(
+            "- NOTE: All build components are on the same version across all rows."
+            " This may indicate a build-related issue (one bad build affecting all runs)."
+        )
+    elif bc.mismatched:
+        lines.append(
+            f"- Builds are mixed across {len(bc.mismatched)} component(s)."
+            " Failures span multiple builds, so a single build regression is less likely."
+        )
+    for component in bc.consistent:
+        counter = bc.version_distributions[component]
+        version = next(
+            (v for v in counter if v not in ("", "N/A", "n/a", "none", "null")), "unknown"
+        )
+        lines.append(f"  - SAME      {component}: {version}")
+    for component in bc.mismatched:
+        counter = bc.version_distributions[component]
+        version_summary = ", ".join(
+            f"{v}({c})" for v, c in counter.most_common() if v not in ("", "N/A", "n/a")
+        )
+        lines.append(f"  - MIXED     {component}: {version_summary}")
+    return "\n".join(lines)
+
+
 def analyze_log(lines: Iterable[str]) -> AnalysisResult:
+    all_lines: list[str] = list(lines)
     severity_counts = {k: 0 for k in SEVERITY_PATTERNS}
     error_counter: collections.Counter[str] = collections.Counter()
     warning_counter: collections.Counter[str] = collections.Counter()
@@ -279,13 +779,16 @@ def analyze_log(lines: Iterable[str]) -> AnalysisResult:
     service_counter: collections.Counter[str] = collections.Counter()
     node_counter: collections.Counter[str] = collections.Counter()
     pod_counter: collections.Counter[str] = collections.Counter()
+    build_version_counters: dict[str, collections.Counter] = {
+        f: collections.Counter() for f in BUILD_VERSION_FIELDS
+    }
     timestamps: list[str] = []
     total = 0
     first_failure_timestamp = ""
     first_failing_step = ""
     first_failure_line = ""
 
-    for raw in lines:
+    for raw in all_lines:
         total += 1
         line = raw.rstrip("\n")
         lower = line.lower()
@@ -356,6 +859,11 @@ def analyze_log(lines: Iterable[str]) -> AnalysisResult:
         if pod and is_error_like:
             pod_counter[pod] += 1
 
+        for build_field in BUILD_VERSION_FIELDS:
+            bv = extract_field(line, [build_field])
+            if bv:
+                build_version_counters[build_field][bv] += 1
+
         for ts in extract_timestamps(line):
             if len(timestamps) < 30:
                 timestamps.append(ts)
@@ -375,6 +883,20 @@ def analyze_log(lines: Iterable[str]) -> AnalysisResult:
         if error_counter
         else 0.0
     )
+
+    active_build_counters = {
+        f: c for f, c in build_version_counters.items() if c
+    }
+    build_consistency = (
+        analyze_build_consistency(active_build_counters) if active_build_counters else None
+    )
+    failure_trend = analyze_failure_trend(all_lines, build_version_counters)
+    duration_anomalies = analyze_duration_anomalies(all_lines)
+    build_introduction = analyze_build_introduction(all_lines, build_version_counters)
+    flaky_tests = analyze_flaky_tests(all_lines)
+    jira_groups = analyze_jira_groups(all_lines)
+    node_isolation = analyze_node_isolation(all_lines)
+    failing_step_groups = analyze_failing_step_groups(all_lines)
 
     return AnalysisResult(
         total_lines=total,
@@ -402,6 +924,14 @@ def analyze_log(lines: Iterable[str]) -> AnalysisResult:
         first_failing_step=first_failing_step,
         first_failure_line=first_failure_line,
         repeated_failure_ratio=repeated_failure_ratio,
+        build_consistency=build_consistency,
+        failure_trend=failure_trend,
+        duration_anomalies=duration_anomalies,
+        build_introduction=build_introduction,
+        flaky_tests=flaky_tests,
+        jira_groups=jira_groups,
+        node_isolation=node_isolation,
+        failing_step_groups=failing_step_groups,
     )
 
 
@@ -475,22 +1005,12 @@ def build_search_guidance(result: AnalysisResult) -> str:
 
     guidance = [
         "Search strategy:",
-        f"1) Start broad and quantify failure lines: rg -n -i \"error|exception|fatal|timeout|failed\" <logfile>",
-        f"2) Pivot to the dominant failure text: rg -n -i \"{term_string}\" <logfile>",
-        f"3) Lock onto the affected workload: rg -n -i \"{primary_service}|{primary_node}|{primary_pod}\" <logfile>",
-        f"4) Look at the first failure window around {first_failure_ts} and the next 2-5 minutes for causality",
-        f"5) Compare early warnings to failures: rg -n -i \"{warning_string}\" <logfile>",
-        f"6) Confirm the exact recurring signature count: rg -n -F \"{exact_signature}\" <logfile>",
-        "7) If logs are huge, start with tail or a sliced export around the first failure before widening the search",
+        f"1) Broad scan: rg -n -i \"error|exception|fatal|timeout|failed\" <logfile>",
+        f"2) Dominant failure: rg -n -i \"{term_string}\" <logfile>",
+        f"3) Affected workload: rg -n -i \"{primary_service}|{primary_node}|{primary_pod}\" <logfile>",
+        f"4) First failure window: around {first_failure_ts} (+2-5 min)",
+        f"5) Exact signature count: rg -n -F \"{exact_signature}\" <logfile>",
     ]
-    if result.issue_clusters:
-        guidance.append("8) Issue-specific follow-up searches:")
-        for idx, (scope, category, signature, count) in enumerate(result.issue_clusters[:4], start=1):
-            issue_pattern = build_issue_search_pattern(scope, signature)
-            guidance.append(f"   {idx}. {scope} [{category}, {count} hits]")
-            guidance.append(f"      rg -n -i \"{issue_pattern}\" <logfile>")
-            for hint in build_issue_remediation_hint(category, scope)[:2]:
-                guidance.append(f"      {hint}")
     return "\n".join(guidance)
 
 
@@ -988,85 +1508,70 @@ def build_follow_up_guidance(result: AnalysisResult) -> str:
 def format_analysis_summary(result: AnalysisResult) -> str:
     sev = result.severity_counts
     inference = infer_likely_environment_failure(result)
-    category_totals = summarize_issue_categories(result)
-    dominant_category = category_totals.most_common(1)[0][0] if category_totals else "general failure"
-    dominant_category_hits = category_totals[dominant_category] if category_totals else 0
-    top_case = result.top_test_cases[0][0] if result.top_test_cases else "Not identified"
-    top_product = result.top_products[0][0] if result.top_products else "Not identified"
-    top_branch = result.top_branches[0][0] if result.top_branches else "Not identified"
-    top_cluster = result.top_cluster_ids[0][0] if result.top_cluster_ids else "Not identified"
-    top_fault = result.top_fault_ids[0][0] if result.top_fault_ids else "Not identified"
-    verdicts = ", ".join([f"{name}={count}" for name, count in sorted(result.verdict_counts.items())]) or "Not available"
-    origin_verdicts = ", ".join([f"{name}={count}" for name, count in sorted(result.origins_verdict_counts.items())]) or "Not available"
+    verdicts = ", ".join([f"{name}={count}" for name, count in sorted(result.verdict_counts.items())]) or "N/A"
 
     def format_top_items(items: list[tuple[str, int]], limit: int = 5) -> str:
         return ", ".join([f"{name}({count})" for name, count in items[:limit]])
 
     lines = [
         "Technical summary:",
-        f"- Total log lines analyzed: {result.total_lines}",
-        f"- Data mode: {result.data_mode}",
-        f"- Verdict counts: {verdicts}",
-        f"- Origin verdict counts: {origin_verdicts}",
+        f"- Lines: {result.total_lines}  |  Mode: {result.data_mode}  |  Verdicts: {verdicts}",
         (
-            "- Severity indicators found: "
-            f"fatal={sev['fatal']}, error={sev['error']}, timeout={sev['timeout']}, warning={sev['warning']}"
+            f"- Severity: fatal={sev['fatal']}, error={sev['error']}, "
+            f"timeout={sev['timeout']}, warning={sev['warning']}"
         ),
-        f"- Dominant issue category: {dominant_category} ({dominant_category_hits} clustered hits)",
         f"- Likely root cause: {inference.reason} ({inference.confidence} confidence)",
-        f"- Short explanation: {inference.explanation}",
+        f"- {inference.explanation}",
     ]
-    if result.data_mode == "failed-only":
-        lines.append("- Dataset note: failed-only mode, so the summary is focused on repeated failure patterns.")
-    elif result.data_mode == "mixed pass/fail":
-        lines.append("- Dataset note: mixed pass/fail data, so failed rows can be compared against passing rows.")
-    elif result.data_mode == "passed-only":
-        lines.append("- Dataset note: passed-only data, so failure clustering is limited.")
     if result.first_failure_timestamp:
-        lines.append(f"- First detected failure timestamp: {result.first_failure_timestamp}")
-    if result.first_failing_step:
-        lines.append(f"- First failing step: {result.first_failing_step}")
+        lines.append(f"- First failure: {result.first_failure_timestamp}  |  Step: {result.first_failing_step or 'N/A'}")
     if result.first_failure_line:
         lines.append(f"- First failure signature: {result.first_failure_line}")
-    lines.append(f"- Top failing test case: {top_case}")
-    if result.top_services:
-        lines.append(f"- Services with most failures: {format_top_items(result.top_services)}")
+    if result.top_test_cases:
+        lines.append(f"- Top test cases: {format_top_items(result.top_test_cases)}")
+    if result.top_products or result.top_branches:
+        lines.append(
+            f"- Product: {format_top_items(result.top_products)}  |  Branch: {format_top_items(result.top_branches)}"
+        )
+    if result.top_cluster_ids or result.top_fault_ids:
+        lines.append(
+            f"- Clusters: {format_top_items(result.top_cluster_ids)}  |  Fault IDs: {format_top_items(result.top_fault_ids)}"
+        )
     if result.top_nodes:
         lines.append(f"- Nodes with most failures: {format_top_items(result.top_nodes)}")
-    if result.top_pods:
-        lines.append(f"- Pods with most failures: {format_top_items(result.top_pods)}")
     if result.top_error_lines:
-        dominant_failures = sum(count for _, count in result.top_error_lines[:5])
-        lines.append(
-            f"- Repeated failure concentration: {result.repeated_failure_ratio:.1%} of failure lines belong to recurring signatures"
-        )
-        lines.append(f"- Dominant top-5 failure signatures account for {dominant_failures} matched failure lines")
-    if result.top_products:
-        lines.append(f"- Product focus: {format_top_items(result.top_products)}")
-    if result.top_branches:
-        lines.append(f"- Branch focus: {format_top_items(result.top_branches)}")
-    if result.top_cluster_ids:
-        lines.append(f"- Cluster IDs: {format_top_items(result.top_cluster_ids)}")
-    if result.top_fault_ids:
-        lines.append(f"- Fault IDs: {format_top_items(result.top_fault_ids)}")
+        lines.append(f"- Repeated failure ratio: {result.repeated_failure_ratio:.1%}")
+        lines.append("- Top recurring failures:")
+        for msg, count in result.top_error_lines[:5]:
+            lines.append(f"  [{count}x] {msg}")
     if result.issue_clusters:
-        lines.append("- Distinct issue clusters identified:")
+        lines.append("- Issue clusters:")
         for scope, category, signature, count in result.issue_clusters[:5]:
-            lines.append(f"  - [{count}x] {scope} | {category} | {signature}")
-    if result.sample_timestamps:
-        lines.append(f"- Sample timeline markers: {', '.join(result.sample_timestamps[:5])}")
-    if result.top_test_cases:
-        lines.append(f"- Test cases with most rows: {format_top_items(result.top_test_cases)}")
-    if result.suspected_components:
-        lines.append(f"- Most referenced components/nodes: {format_top_items(result.suspected_components)}")
-    if result.top_error_lines:
-        lines.append("- Top recurring failure signatures:")
-        for msg, count in result.top_error_lines[:8]:
-            lines.append(f"  - [{count}x] {msg}")
-    if result.top_warning_lines:
-        lines.append("- Top recurring warning signatures:")
-        for msg, count in result.top_warning_lines[:3]:
-            lines.append(f"  - [{count}x] {msg}")
+            lines.append(f"  [{count}x] {scope} | {category} | {signature}")
+    if result.build_consistency:
+        lines.append("")
+        lines.append(format_build_consistency_summary(result.build_consistency))
+    if result.failure_trend:
+        lines.append("")
+        lines.append(format_failure_trend_summary(result.failure_trend))
+    if result.duration_anomalies and result.duration_anomalies.has_anomalies:
+        lines.append("")
+        lines.append(format_duration_anomaly_summary(result.duration_anomalies))
+    if result.build_introduction:
+        lines.append("")
+        lines.append(format_build_introduction_summary(result.build_introduction))
+    if result.flaky_tests and (result.flaky_tests.flaky_tests or result.flaky_tests.consistently_failing):
+        lines.append("")
+        lines.append(format_flaky_test_summary(result.flaky_tests))
+    if result.jira_groups:
+        lines.append("")
+        lines.append(format_jira_group_summary(result.jira_groups))
+    if result.node_isolation:
+        lines.append("")
+        lines.append(format_node_isolation_summary(result.node_isolation))
+    if result.failing_step_groups:
+        lines.append("")
+        lines.append(format_failing_step_groups_summary(result.failing_step_groups))
     return "\n".join(lines)
 
 
@@ -1110,6 +1615,13 @@ def build_stakeholder_mail(
         f"- Distinct issue clusters: {issue_overview}",
         f"- Most likely affected area: {component_hint}",
         f"- Product / branch focus: {result.top_products[0][0] if result.top_products else 'Not identified'} / {result.top_branches[0][0] if result.top_branches else 'Not identified'}",
+    ]
+    if result.build_consistency and result.build_consistency.is_build_suspect:
+        mail.append(
+            f"- Build versions are consistent across all rows ({', '.join(result.build_consistency.consistent)})"
+            " — a build-related root cause cannot be ruled out."
+        )
+    mail += [
         "",
         "2. Current context",
         f"- Ongoing ticket details: {ticket_info or 'Not provided'}",
@@ -1186,6 +1698,7 @@ def llm_enhanced_analysis(result: AnalysisResult, model: str, api_key: str) -> s
         f"First failure line: {result.first_failure_line or 'unknown'}\n"
         f"Likely environment failure reason: {inference.reason} ({inference.confidence} confidence)\n"
         f"Why: {inference.explanation}\n"
+        f"Build consistency: {format_build_consistency_summary(result.build_consistency) if result.build_consistency else 'N/A'}\n"
         f"Top errors: {result.top_error_lines[:5]}\n"
         f"Top warnings: {result.top_warning_lines[:5]}\n"
         f"Issue clusters: {result.issue_clusters[:5]}\n"
@@ -1198,6 +1711,84 @@ def llm_enhanced_analysis(result: AnalysisResult, model: str, api_key: str) -> s
         f"Pods: {result.top_pods[:5]}\n"
         f"Timestamps: {result.sample_timestamps[:6]}\n"
     )
+    return call_openrouter(api_key=api_key, model=model, system_prompt=system, user_prompt=user)
+
+
+def llm_what_happened(result: AnalysisResult, model: str, api_key: str) -> str:
+    inference = infer_likely_environment_failure(result)
+    system = "You are a concise incident summarizer. Write plain English only. No bullet points, no headers, no markdown."
+    user = (
+        "Write a 3-5 sentence plain English paragraph explaining what happened based on this data. "
+        "Start with what failed, how many times, then the most likely reason, then what should be checked first.\n"
+        f"Total failures: {sum(result.severity_counts.values())}\n"
+        f"Data mode: {result.data_mode}\n"
+        f"Likely reason: {inference.reason} ({inference.confidence} confidence)\n"
+        f"Top error: {result.top_error_lines[0][0] if result.top_error_lines else 'unknown'}\n"
+        f"First failing step: {result.first_failing_step or 'unknown'}\n"
+        f"Top test case: {result.top_test_cases[0][0] if result.top_test_cases else 'unknown'}\n"
+        f"Node: {result.top_nodes[0][0] if result.top_nodes else 'unknown'}\n"
+        f"Build suspect: {result.build_consistency.is_build_suspect if result.build_consistency else False}\n"
+        f"Flaky tests: {len(result.flaky_tests.flaky_tests) if result.flaky_tests else 0}\n"
+        f"Node isolated: {result.node_isolation.is_isolated_to_single_node if result.node_isolation else False}\n"
+    )
+    return call_openrouter(api_key=api_key, model=model, system_prompt=system, user_prompt=user)
+
+
+def llm_triage_checklist(result: AnalysisResult, model: str, api_key: str) -> str:
+    inference = infer_likely_environment_failure(result)
+    system = "You are a triage engineer. Output a numbered checklist only. Each item must be one specific actionable step. No explanations."
+    flaky = list((result.flaky_tests.flaky_tests or {}).keys())[:3] if result.flaky_tests else []
+    node = result.node_isolation.dominant_node if result.node_isolation else None
+    build = result.build_consistency.consistent[:2] if result.build_consistency and result.build_consistency.is_build_suspect else []
+    user = (
+        "Generate a numbered triage checklist (max 8 steps) based on these findings.\n"
+        f"Likely reason: {inference.reason}\n"
+        f"First failing step: {result.first_failing_step or 'unknown'}\n"
+        f"Top error: {result.top_error_lines[0][0] if result.top_error_lines else 'unknown'}\n"
+        f"Flaky tests found: {flaky}\n"
+        f"Dominant node: {node or 'spread across nodes'}\n"
+        f"Build suspect components: {build}\n"
+        f"Untracked JIRA failures: {result.jira_groups.untracked_count if result.jira_groups else 0}\n"
+        f"Duration outliers: {[tc for tc, _ in (result.duration_anomalies.outliers[:3] if result.duration_anomalies else [])]}\n"
+        f"Top issue clusters: {[(s, c) for s, _, _, c in result.issue_clusters[:3]]}\n"
+    )
+    return call_openrouter(api_key=api_key, model=model, system_prompt=system, user_prompt=user)
+
+
+def llm_root_cause_scorecard(result: AnalysisResult, model: str, api_key: str) -> str:
+    inference = infer_likely_environment_failure(result)
+    build_error_confirmed = is_build_related_error(result)
+    system = "You are a root cause analyst. Output a scorecard table only. For each hypothesis rate it HIGH/MEDIUM/LOW and give one supporting evidence line."
+    user = (
+        "Rate these 4 hypotheses — Build Issue, Environment/Infra Issue, Flaky Test, Node Isolation — "
+        "as HIGH/MEDIUM/LOW likelihood based on evidence. Format: Hypothesis | Rating | Evidence\n"
+        "IMPORTANT RULE: Build Issue is only HIGH if ALL of these are true: "
+        "(1) all rows share the same build version, "
+        "(2) the first_failing_step or error text contains build-related keywords like install/deploy/helm/dallas/image. "
+        "Mixed build versions means Build Issue is LOW. Same version but no build error keywords means MEDIUM at most.\n"
+        f"Build consistency (same across all rows): {result.build_consistency.is_build_suspect if result.build_consistency else False}\n"
+        f"Build error keywords found in errors: {build_error_confirmed}\n"
+        f"First failing step: {result.first_failing_step or 'unknown'}\n"
+        f"Top error: {result.top_error_lines[0][0] if result.top_error_lines else 'unknown'}\n"
+        f"Flaky tests: {len(result.flaky_tests.flaky_tests) if result.flaky_tests else 0}\n"
+        f"Node isolated: {result.node_isolation.is_isolated_to_single_node if result.node_isolation else False}\n"
+        f"Dominant node: {result.node_isolation.dominant_node if result.node_isolation else 'N/A'}\n"
+        f"Dominant failure category: {inference.reason}\n"
+        f"Confidence: {inference.confidence}\n"
+        f"Repeated failure ratio: {result.repeated_failure_ratio}\n"
+    )
+    return call_openrouter(api_key=api_key, model=model, system_prompt=system, user_prompt=user)
+
+
+def llm_cluster_explanations(result: AnalysisResult, model: str, api_key: str) -> str:
+    if not result.issue_clusters:
+        return ""
+    system = "You are a log analyst. For each cluster, write one plain English sentence explaining what likely happened. No bullet formatting — use numbered list only."
+    clusters_text = "\n".join(
+        f"{i}. scope={scope}, category={category}, count={count}, signature={sig[:120]}"
+        for i, (scope, category, sig, count) in enumerate(result.issue_clusters[:6], start=1)
+    )
+    user = f"Explain each of these failure clusters in one plain sentence:\n{clusters_text}"
     return call_openrouter(api_key=api_key, model=model, system_prompt=system, user_prompt=user)
 
 
@@ -1270,7 +1861,7 @@ def read_csv_file(path: str) -> list[str]:
                     "duration_ts",
                     "jira_id",
                     "log_dir",
-                ]
+                ] + BUILD_VERSION_FIELDS
                 selected = {
                     key: str(row.get(key, "") or "").strip()
                     for key in selected_keys
@@ -1356,8 +1947,6 @@ def main() -> int:
 
     print()
     print(format_analysis_summary(result))
-    print()
-    print(build_pod_investigation_guidance(result))
     print()
     print(build_search_guidance(result))
     print()
